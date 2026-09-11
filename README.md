@@ -25,7 +25,8 @@ curl -L -o base.img.gz \
 gunzip -c base.img.gz > fnnas-arm64/fnnas-arm64.img
 
 # 交给 buildfnos.sh 注入设备 u-boot/dtb/fnEnv
-DEVICE=lyt-t68m bash buildfnos.sh
+# DEVICE 指定目标设备名（需与 uboot/<soc>/<device> 目录一致）
+DEVICE=<device> bash buildfnos.sh
 ```
 
 ## 说明
