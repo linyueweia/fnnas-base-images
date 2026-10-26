@@ -50,9 +50,11 @@ cleanup() {
 trap cleanup EXIT
 
 echo
-echo "==== A) 前导区 0~32MiB 清零（去 U-Boot 绑定）===="
-dd if=/dev/zero of="$DST" bs=1M count=32 conv=notrunc status=none
-ok "前 32MiB 已清零"
+echo "==== A) U-Boot 载荷区 [17408, 32MiB) 清零（去绑定；GPT 前17408字节保留）===="
+# 注意：GPT（LBA0 MBR + LBA1 header + LBA2~33 entries）就住在前 17408 字节里，
+# 整段 32MiB 清零会抹掉分区表 → losetup 找不到分区（run #1 实翻车，别再犯）。
+dd if=/dev/zero of="$DST" bs=512 skip=34 seek=34 count=$((32*1024*1024/512-34)) conv=notrunc status=none
+ok "载荷区 [17408,32MiB) 已清零，GPT 保留"
 
 echo
 echo "==== B) 挂载分区 ===="
@@ -160,17 +162,23 @@ umount_safe "$M1"; umount_safe "$M2"
 losetup -d "$LOOP" 2>/dev/null || true
 LOOP=""; trap - EXIT
 
-# 前导区全零终检
+# 终检：载荷区全零 + GPT 完好
 python3 - "$DST" <<'PYEOF'
-import sys
+import sys, struct
 p = sys.argv[1]
 with open(p,'rb') as f:
     head = f.read(32*1024*1024)
-nz = sum(1 for b in head if b)
-print(f"  前32MiB非零字节: {nz}")
-sys.exit(0 if nz == 0 else 1)
+nz = sum(1 for b in head[17408:] if b)
+assert nz == 0, f"载荷区仍有 {nz} 非零字节"
+assert head[512:520] == b'EFI PART', "GPT 头被抹了"
+assert head[510:512] == b'\x55\xaa', "MBR 签名丢失"
+pl, = struct.unpack('<Q', head[72+512:80+512])
+e = head[pl*512:pl*512+128]
+s, = struct.unpack('<Q', e[32:40])
+assert s == 65536, f"p1 起始 LBA={s}（应 65536）"
+print(f"  载荷区全零 ✓  GPT 完好 ✓  p1@LBA{s} ✓")
 PYEOF
-ok "前 32MiB 全零终检通过"
+ok "载荷区全零 + GPT 完好终检通过"
 
 echo
 echo "==== 打包（gzip —— 各仓 workflow 用 gzip -t / gunzip -c 解，格式必须一致）===="

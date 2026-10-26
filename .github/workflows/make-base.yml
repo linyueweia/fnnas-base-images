@@ -90,13 +90,17 @@ jobs:
         run: |
           set -e
           IMG=work/base_new.img
-          echo "── 1) 前 32MiB 全零 ──"
+          echo "── 1) 载荷区全零 + GPT 完好 ──"
           python3 - "$IMG" <<'PY'
-          import sys
+          import sys, struct
           with open(sys.argv[1],'rb') as f: head = f.read(32*1024*1024)
-          nz = sum(1 for b in head if b)
-          print(f"  非零字节: {nz}")
-          sys.exit(0 if nz==0 else 1)
+          nz = sum(1 for b in head[17408:] if b)
+          assert nz == 0, f"载荷区 {nz} 非零"
+          assert head[512:520] == b'EFI PART', "GPT 头没了"
+          pl, = struct.unpack('<Q', head[72+512:80+512])
+          s, = struct.unpack('<Q', head[pl*512+32:pl*512+40])
+          assert s == 65536, f"p1 LBA={s}"
+          print(f"  载荷区全零 ✓ GPT 完好 ✓ p1@{s} ✓")
           PY
           echo "── 2) 挂载双分区核对 ──"
           LOOP=$(sudo losetup -fP --show "$IMG")
@@ -139,9 +143,12 @@ jobs:
           set -e
           TAG="${{ inputs.target_tag || 'v1.1.0' }}"
           ASSET_NAME="fnnas-official-arm64-image_rockchip.img.gz"
-          gzip -c -9 work/base_new.img > work/"$ASSET_NAME"
-          sha256sum work/base_new.img work/"$ASSET_NAME" | sed 's#work/##' > work/SHA256SUMS
-          RAW_SHA=$(sha256sum work/base_new.img | awk '{print $1}')
+          RAW_NAME="fnnas-official-arm64-image_rockchip.img"
+          mv work/base_new.img work/"$RAW_NAME"
+          gzip -c -9 work/"$RAW_NAME" > work/"$ASSET_NAME"
+          # SHA256SUMS 两行都用正式文件名 → 消费端在解压目录里 sha256sum -c 直接通过
+          (cd work && sha256sum "$RAW_NAME" "$ASSET_NAME" > SHA256SUMS)
+          RAW_SHA=$(awk -v f="$RAW_NAME" '$2==f{print $1}' work/SHA256SUMS)
           echo "raw sha256 = $RAW_SHA"
           cat work/SHA256SUMS
           # 创建/复用 release
