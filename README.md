@@ -34,3 +34,18 @@ DEVICE=<device> bash buildfnos.sh
 - 基镜像分区布局：BOOT (ext4) @ 32MiB / 360MiB；rootfs (btrfs) @ 408MiB
 - 构建产物带 SHA256SUMS 校验
 - ⚠️ 仅用于备份与研究，刷写前请备份数据
+
+## 版本
+
+| tag | 内核 | 前导区(0~32MiB) | 说明 |
+|---|---|---|---|
+| `v1.0.0` | 6.18.18.c951-trim | 内嵌 RK3568 U-Boot (ddr-v1.23) | 旧版，**已发布即冻结**（lyw-kf / lyw-hk / xck-nas 锁定它，永不改动） |
+| `src-1.2.0701` | — | — | 源镜像存档（fnOS 1.2.0701 NanoPC-T6 官方原版，md5 402788b6 与官网一致） |
+| `v1.1.0` | 6.18.18.c1145-trim | **清零**（U-Boot 由各板构建注入） | 通用版，由 `make-base.yml` 从源镜像去设备绑定制成 |
+
+### 制作与切换
+- 制作：Actions → *Make fnOS Universal Base Image* → Run workflow（源 md5 / 产物自证双门禁）
+- 各仓切换：workflow 的 `base_image_tag` 改为新 tag + 同步 `base_image_sha256` 断言（一次一仓，CI 绿 + 上板验再切下一个）
+- **U-Boot 口径（2026-10-26 定）**：基镜像不带 U-Boot（3568/3588 无法共用一份，飞牛官方也是每板一份）；
+  各板构建时注入本板 U-Boot（如 `lyw-hk/uboot/` 存 H88K 实机提取件），刷写时保留板上现有 U-Boot。
+  业界同款做法：ophub/u-boot（按板分文件的 U-Boot 库，构建时按 DEVICE 注入）。

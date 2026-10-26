@@ -1,0 +1,154 @@
+#==========================================================================
+# 制作 fnOS 通用基镜像（去设备绑定）
+#
+# 源：src-1.2.0701 release 的 NanoPC-T6 官方镜像（md5 与 fnnas.com 公布值核对）
+# 产物：v1.1.0 release，资产名与 v1.0.0 相同（fnnas-official-arm64-image_rockchip.img.gz）
+#       → 各板构建仓只需把 base_image_tag 改成 v1.1.0 + 同步 sha256 断言即可切换
+#
+# 改造（make-base.sh，用户拍板方案）：
+#   前导区 0~32MiB 清零（U-Boot 由各板构建注入）/ fnEnv 删 fdtfile / board.json→generic
+#   / hostname→trim / 删设备特定引导件 / 设备名残留全扫
+#
+# 安全边界：v1.0.0 release 一字节不动（所有现有仓锁定它，零影响）。
+#==========================================================================
+name: Make fnOS Universal Base Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: "源镜像所在 release tag"
+        required: false
+        default: "src-1.2.0701"
+        type: string
+      source_asset:
+        description: "源镜像资产名"
+        required: false
+        default: "fnos_Mainland-PE_arm_1.2.0701_nanopc-t6_2882.img.gz"
+        type: string
+      source_md5:
+        description: "源镜像 md5（fnnas.com 官网公布值）"
+        required: false
+        default: "402788b6dad39f2c7afe5c18f3fee893"
+        type: string
+      target_tag:
+        description: "产物 release tag"
+        required: false
+        default: "v1.1.0"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  make:
+    name: De-bind and publish base image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq btrfs-progs e2fsprogs xz-utils gzip fdisk gawk
+
+      - name: Fetch source image from src release
+        run: |
+          set -e
+          TAG="${{ inputs.source_tag || 'src-1.2.0701' }}"
+          ASSET="${{ inputs.source_asset || 'fnos_Mainland-PE_arm_1.2.0701_nanopc-t6_2882.img.gz' }}"
+          MD5="${{ inputs.source_md5 || '402788b6dad39f2c7afe5c18f3fee893' }}"
+          mkdir -p work
+          URL="https://github.com/linyueweia/fnnas-base-images/releases/download/${TAG}/${ASSET}"
+          echo "  下载源: $URL"
+          curl -fL --retry 3 -o work/src.img.gz "$URL"
+          gzip -t work/src.img.gz
+          GOT="$(md5sum work/src.img.gz | awk '{print $1}')"
+          [[ "$GOT" == "$MD5" ]] || { echo "✗ 源 md5 不符：期望 $MD5 实得 $GOT"; exit 1; }
+          echo "  ✓ 源 md5 = 官网公布值 $GOT"
+          gunzip -c work/src.img.gz > work/src.img
+          rm -f work/src.img.gz
+          ls -la work/
+
+      - name: Make base image (de-bind)
+        run: |
+          set -e
+          chmod +x make-base.sh
+          sudo bash make-base.sh work/src.img work/base_new.img
+          ls -la work/
+
+      - name: Independent self-check (硬门禁)
+        run: |
+          set -e
+          IMG=work/base_new.img
+          echo "── 1) 前 32MiB 全零 ──"
+          python3 - "$IMG" <<'PY'
+          import sys
+          with open(sys.argv[1],'rb') as f: head = f.read(32*1024*1024)
+          nz = sum(1 for b in head if b)
+          print(f"  非零字节: {nz}")
+          sys.exit(0 if nz==0 else 1)
+          PY
+          echo "── 2) 挂载双分区核对 ──"
+          LOOP=$(sudo losetup -fP --show "$IMG")
+          sudo mkdir -p /mnt/sc_b /mnt/sc_r
+          sudo mount "${LOOP}p1" /mnt/sc_b
+          sudo mount "${LOOP}p2" /mnt/sc_r
+          # fnEnv 无 fdtfile、无设备名
+          ! grep -q '^fdtfile=' /mnt/sc_b/fnEnv.txt || { echo "✗ fnEnv 仍有 fdtfile"; exit 1; }
+          grep -q 'cma=256M' /mnt/sc_b/fnEnv.txt && echo "  ✓ extraargs 通用行保留"
+          ! grep -rqi 'nanopc-t6' /mnt/sc_b/fnEnv.txt /mnt/sc_b/board.json || { echo "✗ boot 有设备名"; exit 1; }
+          grep -q 'generic,rockchip' /mnt/sc_b/board.json || { echo "✗ board.json 未通用化"; exit 1; }
+          echo "  ✓ fnEnv/board.json"
+          # hostname
+          HN=$(sudo cat /mnt/sc_r/etc/hostname)
+          [[ "$HN" == "trim" ]] || { echo "✗ hostname=$HN 应为 trim"; exit 1; }
+          echo "  ✓ hostname=trim"
+          # rootfs 设备名残留
+          if sudo grep -rlI -i 'nanopc-t6' /mnt/sc_r/etc /mnt/sc_r/root /mnt/sc_r/opt 2>/dev/null | head -5 | grep -q .; then
+            sudo grep -rlI -i 'nanopc-t6' /mnt/sc_r/etc /mnt/sc_r/root /mnt/sc_r/opt 2>/dev/null | head -10
+            echo "✗ rootfs 有设备名残留"; exit 1
+          fi
+          echo "  ✓ rootfs 无设备名残留"
+          # 内核 + dtb 全量
+          NV=$(ls /mnt/sc_b/vmlinuz-* | head -1)
+          echo "  内核: $(basename "$NV")"
+          NDTB=$(ls /mnt/sc_b/dtb/rockchip/*.dtb | wc -l)
+          [[ "$NDTB" -ge 200 ]] || { echo "✗ dtb 只有 $NDTB"; exit 1; }
+          echo "  ✓ dtb 全量 $NDTB 个"
+          # boot.scr 引导链
+          test -f /mnt/sc_b/boot.scr || { echo "✗ 缺 boot.scr"; exit 1; }
+          echo "  ✓ boot.scr"
+          sudo umount /mnt/sc_b /mnt/sc_r
+          sudo losetup -d "$LOOP"
+          echo "== 独立自证通过 =="
+
+      - name: Publish v1.1.0 release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="${{ inputs.target_tag || 'v1.1.0' }}"
+          ASSET_NAME="fnnas-official-arm64-image_rockchip.img.gz"
+          gzip -c -9 work/base_new.img > work/"$ASSET_NAME"
+          sha256sum work/base_new.img work/"$ASSET_NAME" | sed 's#work/##' > work/SHA256SUMS
+          RAW_SHA=$(sha256sum work/base_new.img | awk '{print $1}')
+          echo "raw sha256 = $RAW_SHA"
+          cat work/SHA256SUMS
+          # 创建/复用 release
+          REL_ID=$(gh release view "$TAG" --repo "${{ github.repository }}" --json id -q .id 2>/dev/null || true)
+          if [[ -z "$REL_ID" ]]; then
+            NOTES="通用基镜像 $TAG（源：fnOS 1.2.0701 NanoPC-T6 官方镜像，md5 402788b6 与官网一致）；改造：前导区清零(U-Boot 由各板构建注入)/fnEnv去fdtfile/board.json generic/hostname trim/设备名残留全扫/内核 6.18.18.c1145-trim/dtb 全量；切换方法：各仓 base_image_tag 改本 tag + 同步 base_image_sha256"
+            gh release create "$TAG" --repo "${{ github.repository }}" \
+              --title "fnOS Universal Base Image $TAG" \
+              --notes "$NOTES"
+
