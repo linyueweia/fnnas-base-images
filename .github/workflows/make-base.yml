@@ -158,4 +158,5 @@ jobs:
             gh release create "$TAG" --repo "${{ github.repository }}" \
               --title "fnOS Universal Base Image $TAG" \
               --notes "$NOTES"
+          fi
 
