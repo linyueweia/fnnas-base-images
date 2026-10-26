@@ -14,6 +14,9 @@
 name: Make fnOS Universal Base Image
 
 on:
+  # 全自动主线：上传 src-* 源镜像 release 即自动制作（无需手动 Run workflow）
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       source_tag:
@@ -43,6 +46,8 @@ permissions:
 jobs:
   make:
     name: De-bind and publish base image
+    # workflow_dispatch 手动 或 src-* 源镜像 release 发布 时才跑
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'src-')
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -61,20 +66,66 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq btrfs-progs e2fsprogs xz-utils gzip fdisk gawk
 
-      - name: Fetch source image from src release
+      - name: Resolve inputs (release 事件自动取值 / 手动输入优先)
+        id: src
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REL_TAG: ${{ github.event.release.tag_name }}
+          REL_BODY: ${{ github.event.release.body }}
+          IN_TAG: ${{ inputs.source_tag || '' }}
+          IN_ASSET: ${{ inputs.source_asset || '' }}
+          IN_MD5: ${{ inputs.source_md5 || '' }}
+          IN_TARGET: ${{ inputs.target_tag || '' }}
         run: |
           set -e
-          TAG="${{ inputs.source_tag || 'src-1.2.0701' }}"
-          ASSET="${{ inputs.source_asset || 'fnos_Mainland-PE_arm_1.2.0701_nanopc-t6_2882.img.gz' }}"
-          MD5="${{ inputs.source_md5 || '402788b6dad39f2c7afe5c18f3fee893' }}"
+          TAG="${IN_TAG:-$REL_TAG}"
+          ASSET="${IN_ASSET:-}"
+          MD5="${IN_MD5:-}"
+          if [[ -z "$ASSET" ]]; then
+            # release 事件：取该 release 的第一个 .img.gz 资产
+            ASSET="$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets -q '.assets[0].name')"
+          fi
+          if [[ -z "$MD5" && -n "$REL_BODY" ]]; then
+            # 从 release 说明里抓 md5（一键脚本会自动写入；没写则跳过核对并警告）
+            MD5="$(printf '%s' "$REL_BODY" | grep -oiE 'md5[: =]+[0-9a-f]{32}' | grep -oiE '[0-9a-f]{32}' | head -1 || true)"
+          fi
+          TARGET="${IN_TARGET:-}"
+          if [[ -z "$TARGET" ]]; then
+            # 自动递增：取现有最新 vX.Y.Z，minor +1（v1.1.0 → v1.2.0）
+            CUR="$(gh release list --repo "${{ github.repository }}" --limit 100 \
+              | grep -oE '^v[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+            if [[ -z "$CUR" ]]; then TARGET="v1.0.0";
+            else
+              X="${CUR#v}"; MAJ="${X%%.*}"; REST="${X#*.}"; MIN="${REST%%.*}"; PAT="${REST#*.}"
+              TARGET="v${MAJ}.$((MIN+1)).${PAT}"
+            fi
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+          echo "md5=$MD5" >> "$GITHUB_OUTPUT"
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "  源tag=$TAG  资产=$ASSET  md5=${MD5:-（未提供，跳过核对）}  产物=$TARGET"
+
+      - name: Fetch source image from src release
+        env:
+          TAG: ${{ steps.src.outputs.tag }}
+          ASSET: ${{ steps.src.outputs.asset }}
+          MD5: ${{ steps.src.outputs.md5 }}
+        run: |
+          set -e
           mkdir -p work
-          URL="https://github.com/linyueweia/fnnas-base-images/releases/download/${TAG}/${ASSET}"
+          URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/${ASSET}"
           echo "  下载源: $URL"
-          curl -fL --retry 3 -o work/src.img.gz "$URL"
+          curl -fL --retry 3 -o "work/src.img.gz" "$URL"
           gzip -t work/src.img.gz
-          GOT="$(md5sum work/src.img.gz | awk '{print $1}')"
-          [[ "$GOT" == "$MD5" ]] || { echo "✗ 源 md5 不符：期望 $MD5 实得 $GOT"; exit 1; }
-          echo "  ✓ 源 md5 = 官网公布值 $GOT"
+          if [[ -n "$MD5" ]]; then
+            GOT="$(md5sum work/src.img.gz | awk '{print $1}')"
+            [[ "$GOT" == "$MD5" ]] || { echo "✗ 源 md5 不符：期望 $MD5 实得 $GOT"; exit 1; }
+            echo "  ✓ 源 md5 核对通过 $GOT"
+          else
+            echo "  ⚠ 未提供 md5（release 说明里写 'md5: <hex>' 可启用核对）"
+            gzip -t work/src.img.gz && echo "  ✓ gzip 完整性通过"
+          fi
           gunzip -c work/src.img.gz > work/src.img
           rm -f work/src.img.gz
           ls -la work/
@@ -136,12 +187,12 @@ jobs:
           sudo losetup -d "$LOOP"
           echo "== 独立自证通过 =="
 
-      - name: Publish v1.1.0 release
+      - name: Publish base image release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.src.outputs.target }}
         run: |
           set -e
-          TAG="${{ inputs.target_tag || 'v1.1.0' }}"
           ASSET_NAME="fnnas-official-arm64-image_rockchip.img.gz"
           RAW_NAME="fnnas-official-arm64-image_rockchip.img"
           mv work/base_new.img work/"$RAW_NAME"
@@ -151,12 +202,15 @@ jobs:
           RAW_SHA=$(awk -v f="$RAW_NAME" '$2==f{print $1}' work/SHA256SUMS)
           echo "raw sha256 = $RAW_SHA"
           cat work/SHA256SUMS
-          # 创建/复用 release
+          # 创建（已存在则复用 —— src 重传/重跑场景）
           REL_ID=$(gh release view "$TAG" --repo "${{ github.repository }}" --json id -q .id 2>/dev/null || true)
           if [[ -z "$REL_ID" ]]; then
-            NOTES="通用基镜像 $TAG（源：fnOS 1.2.0701 NanoPC-T6 官方镜像，md5 402788b6 与官网一致）；改造：前导区清零(U-Boot 由各板构建注入)/fnEnv去fdtfile/board.json generic/hostname trim/设备名残留全扫/内核 6.18.18.c1145-trim/dtb 全量；切换方法：各仓 base_image_tag 改本 tag + 同步 base_image_sha256"
+            NOTES="通用基镜像 $TAG（由 Make workflow 自动去设备绑定制作）；改造：前导区清零(U-Boot 由各板构建注入)/fnEnv去fdtfile/board.json generic/hostname trim/boot_board generic/设备名残留全扫；消费端 tag=latest 自动选用 + SHA256SUMS 双校验"
             gh release create "$TAG" --repo "${{ github.repository }}" \
               --title "fnOS Universal Base Image $TAG" \
               --notes "$NOTES"
           fi
-
+          # 上传资产（--clobber 幂等）
+          gh release upload "$TAG" --repo "${{ github.repository }}" --clobber \
+            work/"$ASSET_NAME" work/SHA256SUMS
+          echo "== 已发布 $TAG =="
