@@ -134,6 +134,10 @@ if [[ -n "$RES" ]]; then
     for f in $RES; do
         case "$f" in
             */machine-id) : > "$f"; ok "清空 $f";;
+            */etc/device_info/boot_board)
+                # 飞牛板名文件（旧基 v1.0.0 遗留 nanopi-r5s 未清；我们改 generic 彻底去绑定）
+                sed -i 's/nanopc-t6/generic/g' "$f"
+                ok "boot_board → generic ($(cat "$f" | tr -d '\n' | head -c 60))";;
             *) echo "     ⚠ 需人工确认: $f";;
         esac
     done
